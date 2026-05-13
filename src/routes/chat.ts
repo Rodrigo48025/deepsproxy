@@ -13,6 +13,7 @@ import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
 import { createDeepSeekStream, updateSessionParent } from '../services/deepseek.ts';
 import { OpenAIRequest, ChoiceDelta, Message } from '../utils/types.ts';
+import { robustParseJSON } from '../utils/json.ts';
 import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
 
@@ -305,15 +306,9 @@ export async function chatCompletions(c: Context) {
                     if (endIdx !== -1) {
                       let toolJsonStr = contentEmitBuffer.substring(0, endIdx).trim();
                       try {
-                        // Robust JSON sanitization
-                        toolJsonStr = toolJsonStr.replace(/```json/g, '').replace(/```/g, '').trim();
-                        const startJ = toolJsonStr.indexOf('{');
-                        const endJ = toolJsonStr.lastIndexOf('}');
-                        if (startJ !== -1 && endJ !== -1 && endJ >= startJ) {
-                          toolJsonStr = toolJsonStr.substring(startJ, endJ + 1);
-                        }
-
-                        const toolCallObj = JSON.parse(toolJsonStr);
+                        const toolCallObj = robustParseJSON(toolJsonStr);
+                        if (!toolCallObj) throw new Error('Empty tool call');
+                        
                         const toolId = 'call_' + uuidv4();
                         
                         await writeEvent({
