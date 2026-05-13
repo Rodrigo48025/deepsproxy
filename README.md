@@ -35,8 +35,6 @@ npx playwright install
 Create a `.env` file in the project root:
 
 ```env
-DEEPSEEK_EMAIL=your_email@example.com
-DEEPSEEK_PASSWORD=your_password
 PORT=3000
 ```
 

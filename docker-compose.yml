@@ -5,8 +5,6 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - DEEPSEEK_EMAIL=seu_email_aqui
-      - DEEPSEEK_PASSWORD=sua_senha_aqui
       - PORT=3000
       - API_KEY=sua_api_key_aqui
     volumes:
