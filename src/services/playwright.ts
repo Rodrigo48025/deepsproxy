@@ -3,9 +3,6 @@
  * Project: deepsproxy
  * Author: Pedro Farias
  * Created: 2026-05-09
- * 
- * Last Modified: Sat May 09 2026
- * Modified By: Pedro Farias
  */
 
 import { chromium, BrowserContext, Page } from 'playwright';
@@ -13,23 +10,42 @@ import path from 'path';
 
 let context: BrowserContext | null = null;
 export let activePage: Page | null = null;
-let currentHeaders: Record<string, string> = {};
 
-export async function initPlaywright(headless = true) {
+// Lock para garantir que apenas uma navegação acontece por vez
+let navigationLock: Promise<void> = Promise.resolve();
+
+export async function initPlaywright(forceHeadless?: boolean) {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return;
-  if (context) {
-    return;
-  }
+  if (context) return;
 
-  const profilePath = path.resolve('deepseek_profile');
+  // Prioridade: argumento da função > .env > default (true)
+  const isHeadless = forceHeadless !== undefined ? forceHeadless : (process.env.PLAYWRIGHT_HEADLESS !== 'false');
+  const executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined;
   
+  // Caminho absoluto para garantir que os cookies são os mesmos do login
+  const profilePath = path.resolve(process.cwd(), 'deepseek_profile');
+  
+  console.log(`🌐 [Playwright] Inicializando browser (Headless: ${isHeadless})`);
+  console.log(`📂 [Playwright] Usando perfil: ${profilePath}`);
+
   context = await chromium.launchPersistentContext(profilePath, {
-    headless,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    headless: isHeadless,
+    executablePath,
+    viewport: { width: 1280, height: 720 },
   });
 
-  // Keep an active page to fetch PoW headers on demand
-  activePage = await context.newPage();
+  // Reutiliza a página inicial que o PersistentContext abre automaticamente
+  const pages = context.pages();
+  activePage = pages[0];
+
+  // Fecha abas extras se existirem
+  for (let i = 1; i < pages.length; i++) {
+    await pages[i].close();
+  }
+
+  if (!activePage) {
+    activePage = await context.newPage();
+  }
 }
 
 export async function closePlaywright() {
@@ -41,83 +57,90 @@ export async function closePlaywright() {
   }
 }
 
-/**
- * Ensures the session is valid and extracts headers, PoW, and session ID.
- */
 export async function getDeepSeekHeaders(forceNew = false): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: number | null }> {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) {
-    // Generate a unique session ID if requested for testing isolation
-    const mockSessionId = process.env.TEST_SESSION_ID || 'mock-session';
-    return { headers: { authorization: 'Bearer MOCK' }, chatSessionId: mockSessionId, parentMessageId: null };
-  }
+  // Aguarda a sua vez na fila
+  const currentLock = navigationLock;
+  let release: () => void;
+  navigationLock = new Promise((resolve) => { release = resolve; });
+  await currentLock;
 
-  if (!activePage) {
-    throw new Error('Playwright not initialized');
-  }
+  try {
+    if (!activePage) throw new Error('Playwright não inicializado');
 
-  // Navigate to deepseek chat. If forceNew is true or we're not on deepseek, go to home page.
-  const currentUrl = activePage.url();
-  const isOnDeepSeek = currentUrl.includes('chat.deepseek.com');
-  const isOnSpecificChat = isOnDeepSeek && /\/chat\/\d+/.test(currentUrl);
+    console.log('🔄 [Auth] Capturando novo PoW...');
 
-  if (!isOnDeepSeek || forceNew || isOnSpecificChat) {
-    await activePage.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded' });
-  }
+    // Navega para o DeepSeek se necessário ou se estivermos na página de login
+    const currentUrl = activePage.url();
+    const isAtLogin = currentUrl.includes('/sign_in') || currentUrl.includes('/login');
+    
+    if (!currentUrl.includes('chat.deepseek.com') || isAtLogin || forceNew) {
+      console.log(`🌐 [Auth] Navegando para chat.deepseek.com (URL actual: ${currentUrl})...`);
+      await activePage.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
 
-  // Wait for the textarea
-  await activePage.waitForSelector('textarea', { timeout: 30000 }).catch(() => {
-    throw new Error('Timeout waiting for chat input. Are you logged in?');
-  });
+    // Espera pelo textarea — é a prova definitiva de que estamos logados
+    console.log('⏳ [Auth] Aguardando interface do chat...');
+    const textarea = await activePage.waitForSelector('textarea', { timeout: 15000 }).catch(() => null);
 
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Timeout waiting for PoW headers')), 30000);
-
-    const routeHandler = async (route: any, request: any) => {
-      clearTimeout(timeout);
+    if (!textarea) {
+      // O textarea não apareceu — agora sim verificamos se estamos na página de login
+      const finalUrl = activePage.url();
+      console.error(`❌ [Auth] textarea não encontrado. URL actual: ${finalUrl}`);
       
-      const reqHeaders = request.headers();
-      let uiSessionId = '';
-      let uiParentMessageId: number | null = null;
-
-      const postData = request.postData();
-      if (postData) {
-        try {
-          const payload = JSON.parse(postData);
-          if (payload.chat_session_id) {
-            uiSessionId = payload.chat_session_id;
-          }
-          if (payload.parent_message_id !== undefined) {
-            uiParentMessageId = payload.parent_message_id;
-          }
-        } catch (e) {
-          // ignore parsing error
-        }
+      if (finalUrl.includes('/login') || finalUrl.includes('/sign_in')) {
+        throw new Error('SESSÃO EXPIRADA: O DeepSeek redirecionou para login. Executa "npm run login".');
       }
+      throw new Error(`SESSÃO EXPIRADA: Interface do chat não carregou. URL: ${finalUrl}. Executa "npm run login".`);
+    }
 
-      const extractedHeaders = {
-        'x-ds-pow-response': reqHeaders['x-ds-pow-response'] || '',
-        'x-hif-dliq': reqHeaders['x-hif-dliq'] || '',
-        'x-hif-leim': reqHeaders['x-hif-leim'] || '',
-        'authorization': reqHeaders['authorization'] || '',
-        'cookie': reqHeaders['cookie'] || ''
-      };
+    console.log('✅ [Auth] Interface do chat detectada. Capturando PoW...');
 
-      currentHeaders = extractedHeaders;
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        activePage?.unroute('**/api/v0/chat/completion').catch(() => {});
+        reject(new Error('TIMEOUT: O DeepSeek não gerou o desafio PoW a tempo (25s).'));
+      }, 25000);
 
-      // Abort to prevent polluting chat history
-      await route.abort('aborted');
-      
-      // Cleanup route
-      await activePage!.unroute('**/api/v0/chat/completion', routeHandler);
+      activePage!.route('**/api/v0/chat/completion', async (route, request) => {
+        if (request.method() !== 'POST') return route.continue();
+        
+        clearTimeout(timeout);
+        const reqHeaders = request.headers();
+        let uiSessionId = '';
+        let uiParentMessageId: number | null = null;
 
-      resolve({ headers: extractedHeaders, chatSessionId: uiSessionId, parentMessageId: uiParentMessageId });
-    };
+        const postData = request.postData();
+        if (postData) {
+          try {
+            const payload = JSON.parse(postData);
+            uiSessionId = payload.chat_session_id || '';
+            uiParentMessageId = payload.parent_message_id ?? null;
+          } catch {}
+        }
 
-    activePage!.route('**/api/v0/chat/completion', routeHandler).then(() => {
-      // Trigger PoW generation by typing and hitting enter
-      activePage!.fill('textarea', 'a').then(() => {
-        activePage!.keyboard.press('Enter');
+        const extractedHeaders = {
+          'x-ds-pow-response': reqHeaders['x-ds-pow-response'] || '',
+          'authorization': reqHeaders['authorization'] || '',
+          'cookie': reqHeaders['cookie'] || '',
+          'x-hif-dliq': reqHeaders['x-hif-dliq'] || '',
+          'x-hif-leim': reqHeaders['x-hif-leim'] || ''
+        };
+
+        // ABORTA o pedido para não "sujar" o chat com mensagens "a"
+        await route.abort('aborted');
+        await activePage!.unroute('**/api/v0/chat/completion').catch(() => {});
+
+        console.log(`🔑 [Token OK] Session: ${uiSessionId}`);
+        resolve({ headers: extractedHeaders, chatSessionId: uiSessionId, parentMessageId: uiParentMessageId });
       });
+
+      // Digita "a" para disparar o desafio PoW
+      activePage!.fill('textarea', 'a')
+        .then(() => activePage!.keyboard.press('Enter'))
+        .catch(reject);
     });
-  });
+  } finally {
+    // Libera o lock para o próximo pedido na fila
+    release!();
+  }
 }
