@@ -12,23 +12,63 @@ import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
 import { createDeepSeekStream, updateSessionParent } from '../services/deepseek.ts';
+import { getSession, setSessionMessages } from '../services/sessionStore.ts';
 import { OpenAIRequest, ChoiceDelta, Message } from '../utils/types.ts';
 import { robustParseJSON } from '../utils/json.ts';
 import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
 
+function mergeSessionMessages(history: Message[], incoming: Message[]): Message[] {
+  if (!history.length) return incoming;
+  if (incoming.length === 1 && incoming[0].role === 'user') return [...history, incoming[0]];
+
+  const prefixLength = Math.min(history.length, incoming.length);
+  let matching = 0;
+  for (; matching < prefixLength; matching++) {
+    const a = history[matching];
+    const b = incoming[matching];
+    if (a.role === b.role && a.content === b.content) continue;
+    break;
+  }
+
+  if (matching === history.length) return incoming;
+  if (matching === incoming.length) return history;
+  return [...history, ...incoming];
+}
+
 export async function chatCompletions(c: Context) {
   try {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
-    
-    // Extract the prompt
+
+    const bodyAny = body as any;
+    const rawMessages: Message[] = body.messages || [];
+    const cookieHeader = c.req.header('cookie') || c.req.header('Cookie') || '';
+    const cookieSessionId = cookieHeader
+      .split(';')
+      .map(part => part.trim())
+      .find(part => part.startsWith('session_id='))
+      ?.split('=')[1];
+
+    const incomingSessionId = bodyAny.session_id || bodyAny.conversation_id || bodyAny.sessionId || cookieSessionId;
+    const sessionRecord = incomingSessionId ? getSession(incomingSessionId) : null;
+    const sessionHistory = sessionRecord?.messages?.filter(msg => msg.role !== 'system') || [];
+    const sessionId = incomingSessionId || uuidv4();
+    const shouldSetSessionCookie = !incomingSessionId;
+
+    const systemMessages = rawMessages.filter(msg => msg.role === 'system');
+    const userMessages = rawMessages.filter(msg => msg.role !== 'system');
+    const mergedMessages = mergeSessionMessages(sessionHistory, userMessages);
+
     let prompt = '';
-    const messages = body.messages || [];
     let systemPrompt = '';
-    
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
+
+    for (let i = 0; i < systemMessages.length; i++) {
+      systemPrompt += (systemMessages[i].content || '') + '\n\n';
+    }
+
+    for (let i = 0; i < mergedMessages.length; i++) {
+      const msg = mergedMessages[i];
       let contentStr = '';
       if (Array.isArray(msg.content)) {
         contentStr = msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
@@ -38,32 +78,27 @@ export async function chatCompletions(c: Context) {
         contentStr = msg.content || '';
       }
 
-      if (msg.role === 'system') {
-        systemPrompt += contentStr + '\n\n';
-      } else if (i === messages.length - 1) {
-        if (msg.role === 'user') {
-          prompt += `User: ${contentStr}\n\n`;
-        } else if (msg.role === 'assistant') {
-          let assistantContent = contentStr;
-          if ((msg as any).reasoning_content) {
-            assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
-          }
-          if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-             for (const tc of msg.tool_calls) {
-               let args = tc.function?.arguments || '{}';
-               if (typeof args !== 'string') args = JSON.stringify(args);
-               assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
-             }
-          }
-          prompt += `Assistant: ${assistantContent.trim()}\n\n`;
-        } else if (msg.role === 'tool' || msg.role === 'function') {
-          prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
+      if (msg.role === 'user') {
+        prompt += `User: ${contentStr}\n\n`;
+      } else if (msg.role === 'assistant') {
+        let assistantContent = contentStr;
+        if ((msg as any).reasoning_content) {
+          assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
         }
+        if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            let args = tc.function?.arguments || '{}';
+            if (typeof args !== 'string') args = JSON.stringify(args);
+            assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
+          }
+        }
+        prompt += `Assistant: ${assistantContent.trim()}\n\n`;
+      } else if (msg.role === 'tool' || msg.role === 'function') {
+        prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
       }
     }
 
     // Inject tools instructions
-    const bodyAny = body as any;
     if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
       // Better formatting for tools
       const formattedTools = bodyAny.tools.map((t: any) => {
@@ -89,21 +124,20 @@ export async function chatCompletions(c: Context) {
     const finalPrompt = systemPrompt ? `${systemPrompt}\n${prompt}` : prompt;
 
     const isThinkingModel = !body.model.includes('no-thinking');
-    
-    // A session is new if it doesn't have any assistant messages yet.
-    // This handles cases where the first request has [System, User] messages.
-    const isNewSession = !messages.some(m => m.role === 'assistant');
+    const hasExistingSession = Boolean(sessionRecord);
+    const forcedParentId = undefined;
 
     // Empty response retry logic
     let stream: ReadableStream;
     let uiSessionId = '';
+    let effectiveSessionId = sessionId || '';
     let retries = 3;
     while (retries > 0) {
       try {
-        // If it's a new session, force parent_message_id to null
-        const result = await createDeepSeekStream(finalPrompt, isThinkingModel, isNewSession ? null : undefined);
+        const result = await createDeepSeekStream(finalPrompt, isThinkingModel, forcedParentId, sessionId);
         stream = result.stream;
         uiSessionId = result.uiSessionId;
+        effectiveSessionId = result.sessionId;
         break; // Success
       } catch (err: any) {
         retries--;
@@ -116,6 +150,9 @@ export async function chatCompletions(c: Context) {
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache');
     c.header('Connection', 'keep-alive');
+    if (shouldSetSessionCookie) {
+      c.header('Set-Cookie', `session_id=${sessionId}; Path=/; SameSite=Lax`);
+    }
 
     const completionId = 'chatcmpl-' + uuidv4();
 
@@ -137,6 +174,7 @@ export async function chatCompletions(c: Context) {
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model: body.model,
+        session_id: effectiveSessionId || undefined,
         choices: [makeChoice({ role: 'assistant', content: '' })]
       });
 
@@ -150,6 +188,7 @@ export async function chatCompletions(c: Context) {
       
       let reasoningBuffer = '';
       let contentEmitBuffer = '';
+      let assistantResponseText = '';
       let insideTool = false;
       let emittedToolCallCount = 0;
       const TOOL_START = '<tool_call>';
@@ -195,7 +234,7 @@ export async function chatCompletions(c: Context) {
             }
 
             if (dsMessageId) {
-              updateSessionParent(uiSessionId, dsMessageId);
+              updateSessionParent(effectiveSessionId || uiSessionId, dsMessageId, uiSessionId);
             }
 
             let vStr = '';
@@ -266,6 +305,7 @@ export async function chatCompletions(c: Context) {
                       // Found tool start. Emit everything before it as text
                       const textToEmit = contentEmitBuffer.substring(0, startIdx);
                       if (textToEmit && emittedToolCallCount === 0) {
+                        assistantResponseText += textToEmit;
                         await writeEvent({
                           id: completionId,
                           object: 'chat.completion.chunk',
@@ -289,6 +329,7 @@ export async function chatCompletions(c: Context) {
                       
                       const textToEmit = contentEmitBuffer.substring(0, flushIndex);
                       if (textToEmit && emittedToolCallCount === 0) {
+                        assistantResponseText += textToEmit;
                         await writeEvent({
                           id: completionId,
                           object: 'chat.completion.chunk',
@@ -362,6 +403,7 @@ export async function chatCompletions(c: Context) {
 
       // Flush any remaining content emit buffer
       if (!insideTool && contentEmitBuffer.length > 0 && emittedToolCallCount === 0) {
+        assistantResponseText += contentEmitBuffer;
         await writeEvent({
           id: completionId,
           object: 'chat.completion.chunk',
@@ -369,6 +411,14 @@ export async function chatCompletions(c: Context) {
           model: body.model,
           choices: [makeChoice({ content: contentEmitBuffer })]
         });
+      }
+
+      if (effectiveSessionId) {
+        const updatedHistory = mergeSessionMessages(sessionHistory, userMessages);
+        if (assistantResponseText.trim()) {
+          updatedHistory.push({ role: 'assistant', content: assistantResponseText });
+        }
+        setSessionMessages(effectiveSessionId, updatedHistory);
       }
   
       // Send finish reason

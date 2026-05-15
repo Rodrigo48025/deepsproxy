@@ -9,15 +9,11 @@
  */
 
 import { getDeepSeekHeaders } from './playwright.ts';
+import { getSession, getSessionByChatSessionId, upsertSession } from './sessionStore.ts';
 
-// In-memory state to track the last message ID per session to avoid overwriting
-// Use globalThis to ensure it survives module reloads in some test environments
-const sessionStates: Record<string, number | null> = (globalThis as any)._sessionStates || {};
-(globalThis as any)._sessionStates = sessionStates;
-
-export function updateSessionParent(sessionId: string, parentId: number | null) {
-  if (sessionId) {
-    sessionStates[sessionId] = parentId;
+export function updateSessionParent(sessionId: string, parentId: number | null, chatSessionId: string) {
+  if (sessionId && chatSessionId) {
+    upsertSession(sessionId, chatSessionId, parentId);
   }
 }
 
@@ -35,22 +31,41 @@ export interface DeepSeekPayload {
 export async function createDeepSeekStream(
   prompt: string, 
   enableThinking: boolean, 
-  forcedParentId?: number | null
-): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string }> {
+  forcedParentId?: number | null,
+  sessionId?: string
+): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string, sessionId: string }> {
   // Obtain fresh headers/PoW from Playwright
   // If forcedParentId is null, it means we are explicitly starting a new session
   const { headers, chatSessionId, parentMessageId } = await getDeepSeekHeaders(forcedParentId === null);
 
-  // Determine the actual parent ID:
-  // 1. If forcedParentId is provided (even if null), use it.
-  // 2. If tracked parent ID is available for this session, use it.
-  // 3. Fallback to Playwright's state.
+  let effectiveSessionId = sessionId || chatSessionId;
   let actualParentId: number | null = parentMessageId;
-  
+
+  const savedSession = sessionId ? getSession(sessionId) : undefined;
+  if (!savedSession && chatSessionId) {
+    const sessionByChatId = getSessionByChatSessionId(chatSessionId);
+    if (sessionByChatId) {
+      effectiveSessionId = sessionByChatId.id;
+    }
+  }
+
   if (forcedParentId !== undefined) {
     actualParentId = forcedParentId;
-  } else if (chatSessionId && sessionStates[chatSessionId] !== undefined) {
-    actualParentId = sessionStates[chatSessionId];
+  } else if (savedSession) {
+    actualParentId = savedSession.parent_message_id;
+  } else if (!savedSession && chatSessionId) {
+    const sessionByChatId = getSessionByChatSessionId(chatSessionId);
+    if (sessionByChatId) {
+      actualParentId = sessionByChatId.parent_message_id;
+    }
+  }
+
+  if (!effectiveSessionId) {
+    effectiveSessionId = chatSessionId;
+  }
+
+  if (effectiveSessionId && chatSessionId) {
+    upsertSession(effectiveSessionId, chatSessionId, actualParentId);
   }
 
   const payload: DeepSeekPayload = {
@@ -88,5 +103,5 @@ export async function createDeepSeekStream(
     throw new Error(`Failed to fetch from DeepSeek: ${response.status} ${response.statusText} - ${errText}`);
   }
 
-  return { stream: response.body, headers, uiSessionId: chatSessionId };
+  return { stream: response.body, headers, uiSessionId: chatSessionId, sessionId: effectiveSessionId };
 }

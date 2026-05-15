@@ -49,6 +49,8 @@ export interface OpenAIRequest {
   model: string;
   messages: Message[];
   stream?: boolean;
+  session_id?: string;
+  conversation_id?: string;
   /** List of tools available to the LLM */
   tools?: FunctionToolDefinition[];
   /** Control whether the LLM must/can call tools */
